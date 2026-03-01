@@ -1,184 +1,76 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-# 你的 TrendConvNet 和 moving_average_target 直接复用
-# from your_file import TrendConvNet, moving_average_target
-from trend_utils.trend_conv import TrendConvNet, moving_average_target
-def second_diff_smoothness(trend_btc: torch.Tensor) -> torch.Tensor:
+
+class ResidualStripper(nn.Module):
     """
-    ||Δ^2 trend||^2
-    trend_btc: (B, T, C)
+    从原序列中剥离 ARMD 不擅长建模的高频部分。
+    高通核固定为二阶差分 [-1, 2, -1]，仅训练 alpha；z = x - alpha * high。
     """
-    d1 = trend_btc[:, 1:] - trend_btc[:, :-1]
-    d2 = d1[:, 1:] - d1[:, :-1]
-    return (d2 ** 2).mean()
+
+    def __init__(self, feature_size: int):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels=feature_size,
+            out_channels=feature_size,
+            kernel_size=3,
+            padding=1,
+            groups=feature_size,
+            bias=False,
+        )
+        # 固定为二阶差分核 [-1, 2, -1]，每个通道相同
+        with torch.no_grad():
+            w = self.conv.weight  # (C, 1, 3)
+            w.zero_()
+            w[:, 0, 0] = -1.0
+            w[:, 0, 1] = 2.0
+            w[:, 0, 2] = -1.0
+        self.conv.weight.requires_grad = False
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C)
+        x_bct = x.permute(0, 2, 1)   # (B, C, T)
+        high = self.conv(x_bct)       # (B, C, T)
+        high_btc = high.permute(0, 2, 1)  # (B, T, C)
+        z = x - self.alpha * high_btc
+        return z
+
+
 class ARMDTrendWrapper(nn.Module):
     """
-    Wrap your ARMD so Trainer can keep doing:
-        loss = model(data, target=data)
-
-    data is expected to be (B, seq_length, C) where seq_length = pred_len * 2 in your code.
+    Wrap ARMD with ResidualStripper: strip high-frequency then pass to ARMD.
+    Trainer keeps: loss = model(data, target=data)
+    data: (B, seq_length, C), seq_length = pred_len * 2.
     """
 
-    def __init__(
-        self,
-        armd: nn.Module,
-        trend_conv: nn.Module,
-        lambda_smooth: float = 0.0,
-        lambda_ma_init: float = 0.0,
-        ma_kernel: int = 25,
-        detach_trend: bool = False,
-        season_top_k: int = 5,
-    ):
+    def __init__(self, armd: nn.Module, feature_size: int = None):
         super().__init__()
         self.armd = armd
-        self.trend_conv = trend_conv
 
-        # feature_size is taken from underlying ARMD model
-        self.feature_size = getattr(self.armd, "feature_size", None)
-        if self.feature_size is None:
-            raise ValueError("ARMDTrendWrapper expects `armd` to have `feature_size` attribute.")
+        if not hasattr(self.armd, "pred_len"):
+            raise ValueError("ARMD model must expose pred_len")
+        self.pred_len = self.armd.pred_len
 
-        self.lambda_smooth = float(lambda_smooth)
-        self.lambda_ma_init = float(lambda_ma_init)
-        self.ma_kernel = int(ma_kernel)
+        feat = feature_size if feature_size is not None else getattr(self.armd, "feature_size", None)
+        if feat is None:
+            raise ValueError("ARMDTrendWrapper expects `armd` to have `feature_size` or pass feature_size.")
+        self.feature_size = feat
 
-        # 如果你想先让 ARMD 稳定、暂时不回传梯度到 trend，可以 True
-        # 端到端训练就 False
-        self.detach_trend = bool(detach_trend)
-
-        # Top-K FFT seasonal forecasting hyperparameter.
-        # season_top_k <= 0 will fall back to simple persistence.
-        self.season_top_k = int(season_top_k)
-
-        # Projection used to inject seasonal component S as condition for ARMD.
-        # Input: concat[T, S] with dim = 2 * C; Output: conditioned trend input with dim = C.
-        self.trend_cond_proj = nn.Linear(2 * self.feature_size, self.feature_size)
-
-    def _trend(self, x_btc: torch.Tensor) -> torch.Tensor:
-        # x: (B,T,C) -> (B,C,T) -> conv -> (B,T,C)
-        tau = self.trend_conv(x_btc.permute(0, 2, 1)).permute(0, 2, 1)
-        if self.detach_trend:
-            tau = tau.detach()
-        return tau
-
-    def _seasonal_fft_predict(self, s_hist: torch.Tensor, pred_len: int) -> torch.Tensor:
-        """
-        Top-K FFT seasonal forecasting.
-
-        s_hist: (B, H, C) seasonal / residual component from history
-        pred_len: number of future steps to predict (H)
-        """
-        top_k = getattr(self, "season_top_k", 0)
-        if top_k is None or top_k <= 0:
-            # Fallback to simple persistence
-            return s_hist[:, -pred_len:, :]
-
-        B, H, C = s_hist.shape
-        if H <= 0:
-            raise ValueError("History length must be > 0 for FFT seasonal forecasting.")
-
-        # (B, H, C) -> (B, C, H)
-        x_bch = s_hist.permute(0, 2, 1)
-
-        # Real FFT along time dimension
-        freqs = torch.fft.rfft(x_bch, dim=-1)  # (B, C, F)
-
-        # Keep only Top-K frequencies by magnitude for each (B, C)
-        F_dim = freqs.shape[-1]
-        if top_k < F_dim:
-            mag = freqs.abs()
-            # indices: (B, C, top_k)
-            topk_idx = mag.topk(top_k, dim=-1).indices
-            mask = torch.zeros_like(freqs, dtype=torch.bool)
-            mask.scatter_(-1, topk_idx, True)
-            freqs = freqs * mask
-
-        # Inverse FFT to reconstruct smoothed seasonal history of length H
-        s_smooth_bch = torch.fft.irfft(freqs, n=H, dim=-1)
-        s_smooth = s_smooth_bch.permute(0, 2, 1)  # (B, H, C)
-
-        # Periodic extension to future horizon
-        if pred_len <= H:
-            s_pred = s_smooth[:, -pred_len:, :]
-        else:
-            repeat = (pred_len + H - 1) // H
-            s_tiled = s_smooth.repeat(1, repeat, 1)
-            s_pred = s_tiled[:, :pred_len, :]
-
-        return s_pred
+        self.stripper = ResidualStripper(self.feature_size)
 
     def forward(self, data: torch.Tensor, **kwargs):
-        """
-        Return a scalar total loss = armd_loss + reg_loss
-        kwargs will pass into ARMD.forward -> _train_loss
-        """
-        # 1) online trend-seasonal decomposition
-        #    T: trend component, S: seasonal / residual component
-        T = self._trend(data)
-        S = data - T
-
-        # 2) ARMD predicts ONLY trend, but conditioned on seasonal part:
-        #       x_cond = [T, S]  (concat on feature dim)
-        #       x_in   = trend_cond_proj(x_cond)
-        #       trend_hat = ARMD(x_in)
-        x_cond = torch.cat([T, S], dim=-1)  # (B, T, 2C)
-        x_in = self.trend_cond_proj(x_cond)  # (B, T, C), conditioned on S
-
-        #    IMPORTANT: ARMD internally still uses its own diffusion loss
-        #    based on x_in (trend-domain representation).
-        armd_loss = self.armd(x_in, **kwargs)
-
-        # 3) trend regularization (must-have)
-        reg = 0.0
-        if self.lambda_smooth > 0:
-            reg = reg + self.lambda_smooth * second_diff_smoothness(T)
-
-        # 4) optional MA "soft anchor" (warm-up, not a hard pretrain)
-        if self.lambda_ma_init > 0:
-            x_bct = data.permute(0, 2, 1)
-            ma = moving_average_target(x_bct, self.ma_kernel).permute(0, 2, 1)
-            reg = reg + self.lambda_ma_init * F.mse_loss(T, ma)
-
-        return armd_loss + reg
+        H = self.pred_len
+        z = self.stripper(data)
+        real_target = data[:, H:, :]
+        kwargs.pop("target", None)
+        return self.armd(z, target=real_target, **kwargs)
 
     @torch.no_grad()
-    def generate_mts(self, x: torch.Tensor, oracle_season: bool = False):
-        print("WRAPPER generate_mts called")
-        H = self.pred_len if hasattr(self, "pred_len") else x.shape[1] // 2
+    def generate_mts(self, x: torch.Tensor, **kwargs):
+        x = self.stripper(x)
+        return self.armd.generate_mts(x, **kwargs)
 
-        x_hist = x[:, :H, :]
-        x_fut = x[:, H:, :]  # future ground truth (ONLY for oracle/debug)
-
-        # 1) history decomposition
-        T_hist = self._trend(x_hist)
-        S_hist = x_hist - T_hist
-
-        # 2) trend prediction (no-leak), conditioned on S_hist
-        #    构造条件输入：
-        #       x_cond_hist = [T_hist, S_hist]
-        #       x_in_hist   = trend_cond_proj(x_cond_hist)
-        #       trend_hat   = ARMD.generate_mts(x_in_hist)
-        x_cond_hist = torch.cat([T_hist, S_hist], dim=-1)  # (B, H, 2C)
-        x_in_hist = self.trend_cond_proj(x_cond_hist)      # (B, H, C)
-        trend_pred = self.armd.generate_mts(x_in_hist)     # (B, H, C)
-
-        # 3) season prediction
-        if oracle_season:
-            # ⚠️ ORACLE: season constructed from FUTURE truth
-            # Use the same trend filter on future (still leakage)
-            tau_fut = self._trend(x_fut)
-            S_future = x_fut - tau_fut
-        else:
-            # ✅ NO-LEAK: Top-K FFT seasonal forecasting from HISTORY only
-            S_future = self._seasonal_fft_predict(S_hist, pred_len=H)
-
-        # 4) full prediction: y_hat = trend_hat + S_future
-        y_pred = trend_pred + S_future
-        return y_pred
-
-    # 下面两个属性让你 main 里 model.fast_sampling = True 仍然工作
     @property
     def fast_sampling(self):
         return self.armd.fast_sampling
@@ -188,11 +80,7 @@ class ARMDTrendWrapper(nn.Module):
         self.armd.fast_sampling = v
 
     def __getattr__(self, name):
-        """
-        Delegate missing attributes to the wrapped ARMD.
-        This makes Trainer's self.model.betas / self.model.num_timesteps etc. work.
-        """
-        if name in {"armd", "trend_conv", "__getstate__", "__setstate__"}:
+        if name in {"armd", "stripper", "__getstate__", "__setstate__"}:
             return super().__getattr__(name)
         try:
             return super().__getattr__(name)

@@ -21,8 +21,7 @@ from trend_utils.armd_trend_wrapper import ARMDTrendWrapper
 warnings.filterwarnings("ignore")
 
 from engine.solver import Trainer
-from trend_utils.trend_conv import TrendConvNet, train_trend_conv
-from trend_utils.trend_plot import plot_trend_decomposition
+from trend_utils.armd_trend_wrapper import ARMDTrendWrapper
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import mean_absolute_error
 from torch.utils.data import Dataset, DataLoader
@@ -126,21 +125,8 @@ if __name__ == "__main__":
     armd = instantiate_from_config(configs['model']).to(device)
 
     feature_size = configs['model']['params']['feature_size']
-    trend_cfg = configs.get("trend_conv", {})
-    trend_kernel = trend_cfg.get("kernel_size", 25)
-    season_top_k = trend_cfg.get("season_top_k", 5)
 
-    trend_conv = TrendConvNet(feature_size=feature_size, kernel_size=trend_kernel).to(device)
-
-    model = ARMDTrendWrapper(
-        armd=armd,
-        trend_conv=trend_conv,
-        lambda_smooth=trend_cfg.get("lambda_smooth", 1e-2),
-        lambda_ma_init=trend_cfg.get("lambda_ma_init", 0.0),
-        ma_kernel=trend_cfg.get("ma_kernel", 25),
-        detach_trend=False,  # True=先不回传到trend；False=端到端联合优化
-        season_top_k=season_top_k,
-    ).to(device)
+    model = ARMDTrendWrapper(armd=armd, feature_size=feature_size).to(device)
     #configs['solver']['max_epochs']=100
     ###################################################
     # 构建训练集 dataloader
@@ -148,24 +134,7 @@ if __name__ == "__main__":
     dataloader_info = build_dataloader(configs, args) #print(dataloader_info) 地址
     dataloader = dataloader_info['dataloader']
     ###################################################
-    # Trend conv pipeline (training + optional plotting)
-    ###################################################
-    # trend_conv_cfg = configs.get('trend_conv', {})
-    # if trend_conv_cfg.get('enable', True):
-    #     trend_kernel = trend_conv_cfg.get('kernel_size', 5)
-    #     trend_epochs = trend_conv_cfg.get('epochs', 3)
-    #     trend_lr = trend_conv_cfg.get('lr', 1e-3)
-    #     feature_size = configs['model']['params'].get('feature_size')
-    #     if feature_size is None:
-    #         raise ValueError("Missing `feature_size` in model params for trend conv.")
-    #     trend_conv = TrendConvNet(feature_size=feature_size, kernel_size=trend_kernel).to(device)
-    #     train_trend_conv(trend_conv, dataloader, device, epochs=trend_epochs, kernel_size=trend_kernel, lr=trend_lr)
-    #     for p in trend_conv.parameters():
-    #         p.requires_grad = False
-    #     if trend_conv_cfg.get('plot', True):
-    #         seasonal_period = configs['dataloader']['train_dataset']['params'].get('seasonal_period', 24)
-    #         plot_path = os.path.join(args.save_dir, trend_conv_cfg.get('plot_path', 'trend_decomposition.png'))
-    #         plot_trend_decomposition(dataloader, trend_conv, kernel_size=trend_kernel, seasonal_period=seasonal_period, save_path=plot_path)
+
     trainer = Trainer(config=configs, args=args, model=model, dataloader={'dataloader':dataloader})# 初始化 Trainer（包含优化器、损失函数、训练流程等）
     trainer.train() # 训练模型
     ###################################################

@@ -63,6 +63,7 @@ class ARMD(nn.Module):
 
         self.eta = eta
         self.seq_length = seq_length
+        self.pred_len = seq_length  # 供 ARMDTrendWrapper 对齐用
         self.feature_size = feature_size
         # n_feat=feature_size：每个时间点的特征数
         # n_channel=seq_length：序列长度当作 channel/维度（作者的实现习惯）
@@ -306,12 +307,9 @@ class ARMD(nn.Module):
 
         # 如果没有提供 noise，则生成与 x_start 同形状的标准高斯噪声
         noise = default(noise, lambda: torch.randn_like(x_start))
-        # 如果没有显式给 target，默认使用未来段作为 target
+        # 仅当未传入 target 时，使用 x_start 的未来段作为 target；若外部已传 target 则不覆盖
         if target is None:
-            target = x_start[:,pred_len:,:]
-        # 实际上这里无论如何都会覆盖 target
-        # target 是 “未来序列”（预测目标）
-        target = x_start[:,pred_len:,:]
+            target = x_start[:, pred_len:, :]
         x = self.q_sample(x_start=x_start, t=t, noise=noise)  # noise sample
         # 将中间态 x 和时间步 t 输入模型
         # model_out 是模型预测的 x_start（即 x0 的预测）

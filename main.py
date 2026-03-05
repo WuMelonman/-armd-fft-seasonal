@@ -17,11 +17,11 @@ import matplotlib.pyplot as plt
 import warnings
 
 from trend_utils.armd_trend_wrapper import ARMDTrendWrapper
+from trend_utils.trend_plot import plot_trend_decomposition
 
 warnings.filterwarnings("ignore")
 
 from engine.solver import Trainer
-from trend_utils.armd_trend_wrapper import ARMDTrendWrapper
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import mean_absolute_error
 from torch.utils.data import Dataset, DataLoader
@@ -133,6 +133,11 @@ if __name__ == "__main__":
     ###################################################
     dataloader_info = build_dataloader(configs, args) #print(dataloader_info) 地址
     dataloader = dataloader_info['dataloader']
+    ###################################################
+    # 训练前：画一张 MA 分解图（Original / Trend(MA) / Seasonal / Reconstructed）
+    ###################################################
+    plot_path = os.path.join(args.save_dir, 'trend_decomposition.png')
+    plot_trend_decomposition(dataloader, kernel_size=25, save_path=plot_path)
     ###################################################
 
     trainer = Trainer(config=configs, args=args, model=model, dataloader={'dataloader':dataloader})# 初始化 Trainer（包含优化器、损失函数、训练流程等）

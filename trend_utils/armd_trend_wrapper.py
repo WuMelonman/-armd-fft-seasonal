@@ -1,75 +1,103 @@
+"""
+ARMD + 固定分解（趋势用 MA 核 25，季节用 FFT top-k）：
+- 趋势 → ARMD 原模型（训练与预测）
+- 季节 → FFT top-k 外推（仅预测时加回）
+"""
+
 import torch
 import torch.nn as nn
 
+from trend_utils.trend_conv import moving_average_btc
 
-class ResidualStripper(nn.Module):
-    """
-    从原序列中剥离 ARMD 不擅长建模的高频部分。
-    高通核固定为二阶差分 [-1, 2, -1]，仅训练 alpha；z = x - alpha * high。
-    """
 
-    def __init__(self, feature_size: int):
-        super().__init__()
-        self.conv = nn.Conv1d(
-            in_channels=feature_size,
-            out_channels=feature_size,
-            kernel_size=3,
-            padding=1,
-            groups=feature_size,
-            bias=False,
+def fft_topk_forecast(
+    seasonal: torch.Tensor,
+    pred_len: int,
+    topk: int = 5,
+    exclude_dc: bool = True,
+) -> torch.Tensor:
+    """
+    用 FFT 取 top-k 主频，外推得到未来 pred_len 步的季节分量。
+    seasonal: (B, T, C)，历史季节分量
+    返回: (B, pred_len, C)
+    注意：实序列 rfft 重建时需用归一化 2/T（DC 与 Nyquist 用 1/T），否则幅值尺度错误。
+    """
+    B, T, C = seasonal.shape
+    device = seasonal.device
+    dtype = seasonal.dtype
+    nf = (T // 2) + 1  # rfft 长度
+    # (B, T, C) -> (B, C, T)
+    s = seasonal.permute(0, 2, 1)  # (B, C, T)
+    spec = torch.fft.rfft(s, dim=-1)  # (B, C, nf)
+    mag = torch.abs(spec)
+    if topk >= nf - (1 if exclude_dc else 0):
+        topk = max(1, nf - (1 if exclude_dc else 0))
+    mag_sel = mag.clone()
+    if exclude_dc:
+        mag_sel[:, :, 0] = -1
+    topk_mag, topk_idx = torch.topk(mag_sel, topk, dim=-1)  # (B, C, topk)
+
+    # 实序列 rfft：bin 0 为 DC，bin nf-1 为 Nyquist，其余为 2/T 倍幅值
+    t_future = torch.arange(pred_len, device=device, dtype=dtype) + T
+    t_future = t_future.unsqueeze(0).unsqueeze(0)  # (1, 1, pred_len)
+    forecast = torch.zeros(B, C, pred_len, device=device, dtype=dtype)
+    for k in range(topk):
+        idx = topk_idx[:, :, k]  # (B, C)
+        amp_raw = torch.abs(spec).gather(-1, idx.unsqueeze(-1)).squeeze(-1)  # (B, C)
+        # 归一化：DC 和 Nyquist 用 1/T，其余用 2/T
+        scale = torch.where(
+            (idx == 0) | (idx == nf - 1),
+            torch.full_like(amp_raw, 1.0 / T, device=device, dtype=dtype),
+            torch.full_like(amp_raw, 2.0 / T, device=device, dtype=dtype),
         )
-        # 固定为二阶差分核 [-1, 2, -1]，每个通道相同
-        with torch.no_grad():
-            w = self.conv.weight  # (C, 1, 3)
-            w.zero_()
-            w[:, 0, 0] = -1.0
-            w[:, 0, 1] = 2.0
-            w[:, 0, 2] = -1.0
-        self.conv.weight.requires_grad = False
-        self.alpha = nn.Parameter(torch.tensor(0.0))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, C)
-        x_bct = x.permute(0, 2, 1)   # (B, C, T)
-        high = self.conv(x_bct)       # (B, C, T)
-        high_btc = high.permute(0, 2, 1)  # (B, T, C)
-        z = x - self.alpha * high_btc
-        return z
+        amp = amp_raw * scale
+        phase = torch.angle(spec).gather(-1, idx.unsqueeze(-1)).squeeze(-1)  # (B, C)
+        k_float = idx.to(dtype)
+        angle = 2 * 3.141592653589793 * k_float.unsqueeze(-1) * t_future / T + phase.unsqueeze(-1)
+        forecast += amp.unsqueeze(-1) * torch.cos(angle)
+    return forecast.permute(0, 2, 1)  # (B, pred_len, C)
 
 
 class ARMDTrendWrapper(nn.Module):
     """
-    Wrap ARMD with ResidualStripper: strip high-frequency then pass to ARMD.
-    Trainer keeps: loss = model(data, target=data)
-    data: (B, seq_length, C), seq_length = pred_len * 2.
+    包装 ARMD：趋势用固定 MA（核大小 25），季节 = x - trend，用 FFT top-k 外推。
+    - 趋势 → ARMD 原模型（训练与预测）
+    - 季节 → FFT top-k 外推（仅预测时加回）
     """
 
-    def __init__(self, armd: nn.Module, feature_size: int = None):
+    def __init__(
+        self,
+        armd: nn.Module,
+        feature_size: int = None,
+        ma_kernel_size: int = 25,
+        fft_topk: int = 5,
+    ):
         super().__init__()
         self.armd = armd
-
         if not hasattr(self.armd, "pred_len"):
             raise ValueError("ARMD model must expose pred_len")
         self.pred_len = self.armd.pred_len
-
         feat = feature_size if feature_size is not None else getattr(self.armd, "feature_size", None)
         if feat is None:
-            raise ValueError("ARMDTrendWrapper expects `armd` to have `feature_size` or pass feature_size.")
+            raise ValueError("ARMDTrendWrapper expects armd to have feature_size or pass feature_size.")
         self.feature_size = feat
-
-        self.stripper = ResidualStripper(self.feature_size)
+        self.ma_kernel_size = ma_kernel_size
+        self.fft_topk = fft_topk
 
     def forward(self, data: torch.Tensor, **kwargs):
+        # 固定 MA 分解，不参与训练
+        trend, seasonal = moving_average_btc(data, kernel_size=self.ma_kernel_size)
         H = self.pred_len
-        z = self.stripper(data)
-        real_target = data[:, H:, :]
+        real_target_trend = trend[:, H:, :]
         kwargs.pop("target", None)
-        return self.armd(z, target=real_target, **kwargs)
+        return self.armd(trend, target=real_target_trend, **kwargs)
 
     @torch.no_grad()
     def generate_mts(self, x: torch.Tensor, **kwargs):
-        x = self.stripper(x)
-        return self.armd.generate_mts(x, **kwargs)
+        trend, seasonal = moving_average_btc(x, kernel_size=self.ma_kernel_size)
+        trend_pred = self.armd.generate_mts(trend, **kwargs)  # (B, pred_len, C)
+        seasonal_pred = fft_topk_forecast(seasonal, self.pred_len, topk=self.fft_topk)  # (B, pred_len, C)
+        return trend_pred + seasonal_pred
 
     @property
     def fast_sampling(self):
@@ -80,7 +108,7 @@ class ARMDTrendWrapper(nn.Module):
         self.armd.fast_sampling = v
 
     def __getattr__(self, name):
-        if name in {"armd", "stripper", "__getstate__", "__setstate__"}:
+        if name in {"armd", "__getstate__", "__setstate__"}:
             return super().__getattr__(name)
         try:
             return super().__getattr__(name)

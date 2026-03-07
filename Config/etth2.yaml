@@ -9,6 +9,9 @@ model:
     loss_type: 'l1'
     beta_schedule: 'cosine'
     w_grad: True
+    ma_kernel_size: 49
+    fft_topk: 1
+    use_nlinear: true  # 仅 etth2 启用 NLinear trick（last=历史最后一步，无未来泄露）
 
 solver:
   base_lr: 1.0e-3

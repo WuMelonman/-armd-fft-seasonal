@@ -294,7 +294,10 @@ class ARMD(nn.Module):
             raise ValueError(f'invalid loss type {self.loss_type}')
 
     def q_sample(self, x_start, t, noise=None):
-        #滑动窗口
+        # 当输入长度 <= pred_len 时直接返回整段，避免空切片
+        seq_len = x_start.shape[1]
+        if seq_len <= pred_len:
+            return x_start
         index = int(t[0])+1
         x_middle = x_start[:,pred_len-index:-index,:]
         return x_middle

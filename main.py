@@ -127,12 +127,14 @@ if __name__ == "__main__":
     feature_size = configs['model']['params']['feature_size']
     ma_kernel_size = configs['model']['params'].get('ma_kernel_size', 25)
     fft_topk = configs['model']['params'].get('fft_topk', 5)
+    use_nlinear = configs['model']['params'].get('use_nlinear', False)
 
     model = ARMDTrendWrapper(
         armd=armd,
         feature_size=feature_size,
         ma_kernel_size=ma_kernel_size,
         fft_topk=fft_topk,
+        use_nlinear=use_nlinear,
     ).to(device)
     #configs['solver']['max_epochs']=100
     ###################################################

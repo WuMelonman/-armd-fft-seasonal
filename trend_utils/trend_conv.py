@@ -30,7 +30,11 @@ def moving_average_btc(
     # (B, T, C) -> (B, C, T)
     x_bct = x.permute(0, 2, 1)
     weight = torch.ones(C, 1, kernel_size, device=device, dtype=dtype) / kernel_size
-    trend_bct = F.conv1d(x_bct, weight, padding=padding, groups=C)
+    x_pad = F.pad(x_bct, (padding, padding), mode='replicate')
+    trend_bct = F.conv1d(x_pad, weight, padding=0, groups=C)
+    # 偶数 kernel 时 conv 输出为 T+1，截断为 T 以与 x 对齐
+    if trend_bct.shape[-1] != T:
+        trend_bct = trend_bct[..., :T]
     trend = trend_bct.permute(0, 2, 1)  # (B, T, C)
     seasonal = x - trend
     return trend, seasonal

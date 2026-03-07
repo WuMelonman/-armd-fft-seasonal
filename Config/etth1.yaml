@@ -8,6 +8,8 @@ model:
     loss_type: 'l1'
     beta_schedule: 'cosine'
     w_grad: True
+    ma_kernel_size: 24
+    fft_topk: 3
 
 solver:
   base_lr: 1.0e-3

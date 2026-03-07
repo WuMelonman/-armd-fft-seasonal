@@ -125,8 +125,15 @@ if __name__ == "__main__":
     armd = instantiate_from_config(configs['model']).to(device)
 
     feature_size = configs['model']['params']['feature_size']
+    ma_kernel_size = configs['model']['params'].get('ma_kernel_size', 25)
+    fft_topk = configs['model']['params'].get('fft_topk', 5)
 
-    model = ARMDTrendWrapper(armd=armd, feature_size=feature_size).to(device)
+    model = ARMDTrendWrapper(
+        armd=armd,
+        feature_size=feature_size,
+        ma_kernel_size=ma_kernel_size,
+        fft_topk=fft_topk,
+    ).to(device)
     #configs['solver']['max_epochs']=100
     ###################################################
     # 构建训练集 dataloader
@@ -137,7 +144,7 @@ if __name__ == "__main__":
     # 训练前：画一张 MA 分解图（Original / Trend(MA) / Seasonal / Reconstructed）
     ###################################################
     plot_path = os.path.join(args.save_dir, 'trend_decomposition.png')
-    plot_trend_decomposition(dataloader, kernel_size=25, save_path=plot_path)
+    plot_trend_decomposition(dataloader, kernel_size=ma_kernel_size, save_path=plot_path)
     ###################################################
 
     trainer = Trainer(config=configs, args=args, model=model, dataloader={'dataloader':dataloader})# 初始化 Trainer（包含优化器、损失函数、训练流程等）

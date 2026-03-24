@@ -35,7 +35,8 @@ class CustomDataset(Dataset):
         decompose_method = 'stl',  # 'stl'（先只实现这个）
         seasonal_period = 24,  # ETTh1 小时数据：24（天周期）
         predict_component = 'raw',  # 'raw' 或 'trend'
-        return_aux_in_test = True  # test阶段是否在dataset里保留 season/raw future 供外部取用
+        return_aux_in_test = True,  # test阶段是否在dataset里保留 season/raw future 供外部取用
+        use_first_n_features=None,  # 若设置，仅使用前 N 列（如 stock 6 列 CSV 只训前 5 个数值特征）
     ):
 
         super(CustomDataset, self).__init__()
@@ -58,8 +59,16 @@ class CustomDataset(Dataset):
 
         # 读取 CSV 数据并拟合 scaler
         # rawdata: 原始时间序列 [T, C]
-        # scaler : StandardScaler（在全量数据上 fit）
+        # scaler : StandardScaler（在全量数据上 fit；若 use_first_n_features 则仅对截取列 refit）
         self.rawdata, self.scaler = self.read_data(data_root, self.name)
+        if use_first_n_features is not None:
+            n = int(use_first_n_features)
+            if self.rawdata.shape[-1] < n:
+                raise ValueError(
+                    f"use_first_n_features={n} but data has only {self.rawdata.shape[-1]} columns"
+                )
+            self.rawdata = self.rawdata[:, :n]
+            self.scaler = StandardScaler().fit(self.rawdata)
         # 保存样本和 mask 的目录
         self.dir = os.path.join(output_dir, 'samples')
         os.makedirs(self.dir, exist_ok=True)
@@ -240,14 +249,16 @@ class CustomDataset(Dataset):
         - scaler : StandardScaler（已 fit）
         """
         df = pd.read_csv(filepath, header=0)
-        # ETTh 数据第一列是时间戳，删除
-        if name == 'etth':
-            df.drop(df.columns[0], axis=1, inplace=True)
+
+        # 如果第一列是时间列，删除
+        if df.dtypes[0] == 'object':
+            df = df.iloc[:, 1:]
+
         data = df.values
-        #scaler = MinMaxScaler()
-        # 标准化器在全量数据上拟合
+
         scaler = StandardScaler()
         scaler = scaler.fit(data)
+
         return data, scaler
     
     def mask_data(self, seed=2023):

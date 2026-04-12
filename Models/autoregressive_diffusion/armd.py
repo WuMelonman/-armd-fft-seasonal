@@ -5,14 +5,13 @@ import torch.nn.functional as F
 from torch import nn
 from einops import reduce
 from tqdm.auto import tqdm
-from functools import partial
 from Models.autoregressive_diffusion.linear import Linear
-from Models.autoregressive_diffusion.model_utils import default, identity, extract
+from Models.autoregressive_diffusion.model_utils import default, extract
 
 
 # gaussian diffusion trainer class
 
-pred_len = 96# 预测长度（未来要预测的时间步数）
+pred_len = 96  # 预测长度（未来要预测的时间步数）
 
 def linear_beta_schedule(timesteps):
     # 线性 beta 调度：beta 从 beta_start 线性增长到 beta_end
@@ -58,8 +57,11 @@ class ARMD(nn.Module):
             resid_pd=0.,  # residual dropout（当前片段未使用）
             w_grad=True,  # 是否使用梯度相关机制（与你的 Linear 模块有关）
             relation_dim=32,  # 关系建模隐层维度
-            relation_eps=0.05,  # relation residual 强度
-            gate_scale=0.05,  # gate 缩放，保证初始耦合很小
+            relation_eps=0.05,  # 耦合矩阵中 A 的混合强度：M=(1-eps)I+eps*A，eps 小则更保守
+            gate_scale=0.05,  # gate 上界缩放，与 sigmoid 配合保证初始耦合强度较小
+            couple_alpha=0.08,  # 残差融合：x_final = base + alpha*(coupled-base)，保守修正 base
+            couple_loss_weight=0.35,  # lambda_final：联合损失中对 loss_final 的权重
+            reg_weight=1e-3,  # lambda_reg：约束 final 相对 base 的修正幅度
             **kwargs
     ):
         super(ARMD, self).__init__()
@@ -74,14 +76,19 @@ class ARMD(nn.Module):
         self.relation_dim = relation_dim
         self.relation_eps = relation_eps
         self.gate_scale = gate_scale
+        self.couple_alpha = couple_alpha
+        self.couple_loss_weight = couple_loss_weight
+        self.reg_weight = reg_weight
+        # 每变量统计量：mean / std / last / temporal-diff mean 共 4 维 -> relation embedding
         self.rel_proj = nn.Sequential(
-            nn.Linear(1, relation_dim),
+            nn.Linear(4, relation_dim),
             nn.GELU(),
             nn.Linear(relation_dim, relation_dim)
         )
-        # 变量级 gate：输出 [B, C]，经 reshape 为 [B, 1, C] 在时间维广播
+        # step-aware + sample-aware：归一化 t + 每通道时间维 mean/std -> 变量级 gate [B,1,C]
+        gate_in_dim = 1 + 2 * feature_size
         self.gate_mlp = nn.Sequential(
-            nn.Linear(1, relation_dim),
+            nn.Linear(gate_in_dim, relation_dim),
             nn.GELU(),
             nn.Linear(relation_dim, feature_size),
             nn.Sigmoid()
@@ -203,29 +210,37 @@ class ARMD(nn.Module):
         #   - 在 ARMD 中，这里输出的是 x_start（x0 的预测）
 
     def build_relation_matrix(self, x):
-        # x: [B, T, C]
-        # s: [B, C]
-        s = x.mean(dim=1)
-        # h: [B, C, D]
-        h = self.rel_proj(s.unsqueeze(-1))
+        # x: [B, T, C] — 用多统计量刻画变量表征，再构造 attention-style 行归一化 A，数值更稳
+        B, T, C = x.shape
+        mean_c = x.mean(dim=1)
+        std_c = x.std(dim=1, unbiased=False)
+        last_c = x[:, -1, :]
+        if T >= 2:
+            diff_mean_c = (x[:, 1:, :] - x[:, :-1, :]).mean(dim=1)
+        else:
+            diff_mean_c = torch.zeros_like(mean_c)
+        stats = torch.stack([mean_c, std_c, last_c, diff_mean_c], dim=-1)
+        h = self.rel_proj(stats)
         D = h.size(-1)
         logits = torch.matmul(h, h.transpose(-1, -2)) / math.sqrt(D)
-        A_t = torch.tanh(logits)
-        B, _, C = x.shape
+        # 行 softmax：每个变量对其他变量的权重和为 1，避免 tanh 无界带来的不稳定
+        A = torch.softmax(logits, dim=-1)
         I = torch.eye(C, device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, C, C)
-        # M: [B, C, C]，接近单位阵的残差关系矩阵
-        M = I + self.relation_eps * A_t
+        eps = self.relation_eps
+        M = (1.0 - eps) * I + eps * A
         return M
 
     def build_step_gate(self, t, x):
-        # t: [B], x: [B, T, C]
-        # lambda_t: [B, 1, C]，每变量独立耦合强度
+        # t: [B], x: [B, T, C] — 扩散步归一化 + 样本在时间维的 per-channel mean/std，自适应耦合强度
         denom = max(self.num_timesteps - 1, 1)
-        t_norm = t.float() / denom
+        t_norm = (t.float() / denom).view(-1, 1)
         C = x.shape[-1]
         if C != self.feature_size:
             raise ValueError(f"build_step_gate: x.shape[-1]={C} != self.feature_size={self.feature_size}")
-        lambda_t = self.gate_scale * self.gate_mlp(t_norm.view(-1, 1))
+        xm = x.mean(dim=1)
+        xs = x.std(dim=1, unbiased=False)
+        gate_in = torch.cat([t_norm, xm, xs], dim=-1)
+        lambda_t = self.gate_scale * self.gate_mlp(gate_in)
         return lambda_t.view(x.shape[0], 1, C)
 
     def coupled_trend_from_xstart(self, x_t, t, x_start):
@@ -234,13 +249,12 @@ class ARMD(nn.Module):
         sqrt_recipm1 = extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         # z_hat: [B, T, C]
         z_hat = (sqrt_recip * x_t - x_start) / sqrt_recipm1
-        # M_t: [B, C, C], lambda_t: [B, 1, C]
+        # 仅对按时间维中心化后的偏差做跨变量 mixing，减小对主干 z_hat 结构的破坏
+        delta_z = z_hat - z_hat.mean(dim=1, keepdim=True)
         M_t = self.build_relation_matrix(x_t)
         lambda_t = self.build_step_gate(t, x_t)
-        z_cross = torch.einsum('btc,bcd->btd', z_hat, M_t)
-        # z_tilde: [B, T, C]
-        z_tilde = z_hat + lambda_t * (z_cross - z_hat)
-        # x_start_coupled: [B, T, C]
+        delta_cross = torch.einsum('btc,bcd->btd', delta_z, M_t)
+        z_tilde = z_hat + lambda_t * (delta_cross - delta_z)
         x_start_coupled = sqrt_recip * x_t - sqrt_recipm1 * z_tilde
         return x_start_coupled, z_hat, z_tilde, M_t, lambda_t
 
@@ -249,16 +263,18 @@ class ARMD(nn.Module):
         # 输入 x_t 和 t
         # 输出：
         #   - pred_noise: 预测的噪声 ε
-        #   - x_start:   预测的原始样本 x0
+        #   - x_start:   用于扩散的 x0：残差式融合后的 x_start_final（保守修正 base）
         #论文公式(6)
         if training:
             training = False
-        maybe_clip = partial(torch.clamp, min=-2, max=2) if clip_x_start else identity
         x_start_base = self.output(x, t, training)
         x_start_coupled, z_hat, z_tilde, M_t, lambda_t = self.coupled_trend_from_xstart(x, t, x_start_base)
-        #x_start_coupled = maybe_clip(x_start_coupled)
-        pred_noise = self.predict_noise_from_start(x, t, x_start_coupled)
-        return pred_noise, x_start_coupled
+        alpha = self.couple_alpha
+        x_start_final = x_start_base + alpha * (x_start_coupled - x_start_base)
+        if clip_x_start:
+            x_start_final = torch.clamp(x_start_final, min=-2.0, max=2.0)
+        pred_noise = self.predict_noise_from_start(x, t, x_start_final)
+        return pred_noise, x_start_final
 
     def p_mean_variance(self, x, t, clip_denoised=True):
         # 反向扩散一步中，计算 p(x_{t-1} | x_t) 的参数
@@ -359,8 +375,8 @@ class ARMD(nn.Module):
         seq_len = x_start.shape[1]
         if seq_len <= pred_len:
             return x_start
-        index = int(t[0])+1
-        x_middle = x_start[:,pred_len-index:-index,:]
+        index = int(t[0]) + 1
+        x_middle = x_start[:, pred_len - index : -index, :]
         return x_middle
 
     def _train_loss(self, x_start, t, target=None, noise=None, training=True):
@@ -379,12 +395,21 @@ class ARMD(nn.Module):
         # model_out 是模型预测的 x_start（即 x0 的预测）
         x_start_base = self.output(x, t, training)
         x_start_coupled, z_hat, z_tilde, M_t, lambda_t = self.coupled_trend_from_xstart(x, t, x_start_base)
-        # 训练主目标：直接监督 coupled 后的 x_start 与 target 的预测误差
-        train_loss = self.loss_fn(x_start_coupled, target, reduction='none')
-
-        # 将除 batch 外的维度全部展平并取 mean
+        x_start_final = x_start_base + self.couple_alpha * (x_start_coupled - x_start_base)
+        # 联合损失：稳定 base、监督最终用于扩散的预测，并正则化耦合相对 base 的偏离（防 Stock 类过耦合）
+        loss_base = self.loss_fn(x_start_base, target, reduction='none')
+        loss_final = self.loss_fn(x_start_final, target, reduction='none')
+        loss_reg = self.loss_fn(
+            x_start_final - x_start_base,
+            torch.zeros_like(x_start_base),
+            reduction='none',
+        )
+        train_loss = (
+            loss_base
+            + self.couple_loss_weight * loss_final
+            + self.reg_weight * loss_reg
+        )
         train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
-        # 返回 batch 维度上的平均主损失（无 noise loss / 无辅助 loss）
         return train_loss.mean()
 
     def forward(self, x, **kwargs):

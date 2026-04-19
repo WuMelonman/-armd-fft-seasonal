@@ -47,6 +47,7 @@ class CustomDataset(Dataset):
             assert ~(predict_length is not None or missing_ratio is not None), ''
         # 保存基础属性
         self.name, self.pred_len, self.missing_ratio = name, predict_length, missing_ratio
+        self.data_root = data_root  # 用于可视化标题等与具体 CSV 一致（name 可能为通用别名）
         self.style, self.distribution, self.mean_mask_length = style, distribution, mean_mask_length
 
 

@@ -3,6 +3,8 @@ trend_conv 固定 MA 分解的可视化：Original / Trend (MA) / Seasonal / Rec
 与参考图布局一致，纵排、共享 x 轴。
 """
 
+import os
+
 import matplotlib
 matplotlib.use("Agg")
 import math
@@ -67,19 +69,21 @@ def plot_forecast_fit(
     dataset=None,
     title: str = None,
     gt_label: str = "Ground Truth",
-    pred_label: str = "MTMD Prediction",
+    pred_label: str = r"MTMD Prediction",
     figsize=None,
     max_timesteps: int = 200,
     concat_windows: int = None,
 ):
     """
-    单条曲线：真实 vs 预测（蓝=真值、橙=MTMD 预测、浅灰虚线网格）。
+    单条曲线：真实 vs 预测（蓝=真值，橙=MTMD_EX 预测、浅灰虚线网格）。
 
     pred, real: (N, pred_len, C) 与 sample_forecast 输出一致。
     从 ``sample_idx`` 起沿时间拼接若干预测窗，再**只取前 ``max_timesteps`` 个点**画图（默认约 200，横轴不会拉到上千）。
     若 ``concat_windows`` 为 None，则自动取「至少能覆盖 max_timesteps」的最少段数；若设为正整数，则与上述下限取较大者再截断。
     若传入 ``dataset`` 或 ``scaler``，对 (T, C) 做 ``inverse_transform``。
-    ``figsize``：默认正方形 ``(8, 8)``；可自定义。
+    ``figsize``：默认 ``(8, 5)``（与 ``scripts/mtmd_vs_mtmd_ex_barplot.py`` 一致，偏横向）；可自定义。
+    若 ``title`` 为 None 且 ``dataset`` 带有 ``data_root``（如 ``CustomDataset``），则标题自动为
+    ``{CSV 文件名不含扩展名} — variable {channel_idx} (fit)``，与具体数据集文件一致。
     """
     p = np.asarray(pred, dtype=np.float64)
     r = np.asarray(real, dtype=np.float64)
@@ -119,21 +123,28 @@ def plot_forecast_fit(
     y_pr = sl[:, channel_idx]
     t = np.arange(len(y_gt))
 
-    # 参考色：matplotlib 默认蓝 / 浅橙
-    c_gt = "#1f77b4"
-    c_pr = "#ffbb78"
+    if title is None and dataset is not None:
+        dr = getattr(dataset, "data_root", None)
+        if dr:
+            stem = os.path.splitext(os.path.basename(str(dr)))[0]
+            title = f"{stem} — variable {channel_idx} (fit)"
+
+    # 参考色：与柱状图脚本可对照（蓝 / 橙）
+    c_gt = "#4C78A8"
+    c_pr = "#F58518"
 
     if figsize is None:
-        figsize = (8.0, 8.0)
-    fig, ax = plt.subplots(figsize=figsize, dpi=150)
-    ax.plot(t, y_gt, color=c_gt, linewidth=1.1, label=gt_label, zorder=2)
-    ax.plot(t, y_pr, color=c_pr, linewidth=1.1, label=pred_label, zorder=2)
-    ax.grid(True, linestyle="--", alpha=0.5, color="0.75", zorder=0)
+        figsize = (8.0, 5.0)
+    lw_curve = 2.4
+    fig, ax = plt.subplots(figsize=figsize, dpi=300)
+    ax.plot(t, y_gt, color=c_gt, linewidth=lw_curve, label=gt_label, zorder=2, solid_capstyle="round")
+    ax.plot(t, y_pr, color=c_pr, linewidth=lw_curve, label=pred_label, zorder=2, solid_capstyle="round")
+    ax.grid(True, linestyle="--", alpha=0.35, color="0.75", zorder=0)
     ax.set_axisbelow(True)
-    ax.tick_params(axis="both", labelsize=10)
+    ax.tick_params(axis="both", labelsize=11)
     ax.margins(x=0.008)
     for spine in ax.spines.values():
-        spine.set_linewidth(0.8)
+        spine.set_linewidth(1.1)
         spine.set_color("0.15")
 
     if title:
@@ -149,7 +160,7 @@ def plot_forecast_fit(
     leg.get_frame().set_linewidth(0.6)
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"[Plot] forecast fit saved to {save_path}", flush=True)
 

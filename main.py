@@ -192,8 +192,16 @@ if __name__ == "__main__":
     print("sample stats: min/max/mean/std", s.min(), s.max(), s.mean(), s.std())
     print("real_  stats: min/max/mean/std", r.min(), r.max(), r.mean(), r.std())
 
-    ds_name = configs.get("dataloader", {}).get("train_dataset", {}).get("params", {}).get("name", "dataset")
-    fit_png = os.path.join(args.save_dir, f"{ds_name}_forecast_fit_ch0.png")
+    # 标题与保存名与具体数据文件一致（CustomDataset.name 可能为 etth 等通用名）
+    _dr = getattr(test_dataset, "data_root", None)
+    if _dr:
+        dataset_display = os.path.splitext(os.path.basename(str(_dr)))[0]
+    else:
+        dataset_display = (
+            configs.get("dataloader", {}).get("train_dataset", {}).get("params", {}).get("name", "dataset")
+        )
+
+    fit_png = os.path.join(args.save_dir, f"{dataset_display}_forecast_fit_ch0.png")
     plot_forecast_fit(
         sample,
         real_,
@@ -201,7 +209,6 @@ if __name__ == "__main__":
         channel_idx=0,
         sample_idx=0,
         dataset=test_dataset,
-        title=f"{ds_name.upper()} — variable 0 (fit)",
     )
 
     # print("L2 diff mean:", np.mean((s - r) ** 2))

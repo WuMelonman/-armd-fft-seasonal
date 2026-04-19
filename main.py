@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import warnings
 
 from trend_utils.armd_trend_wrapper import ARMDTrendWrapper
-from trend_utils.trend_plot import plot_trend_decomposition
+from trend_utils.trend_plot import plot_trend_decomposition, plot_forecast_fit
 
 warnings.filterwarnings("ignore")
 
@@ -191,6 +191,18 @@ if __name__ == "__main__":
 
     print("sample stats: min/max/mean/std", s.min(), s.max(), s.mean(), s.std())
     print("real_  stats: min/max/mean/std", r.min(), r.max(), r.mean(), r.std())
+
+    ds_name = configs.get("dataloader", {}).get("train_dataset", {}).get("params", {}).get("name", "dataset")
+    fit_png = os.path.join(args.save_dir, f"{ds_name}_forecast_fit_ch0.png")
+    plot_forecast_fit(
+        sample,
+        real_,
+        save_path=fit_png,
+        channel_idx=0,
+        sample_idx=0,
+        dataset=test_dataset,
+        title=f"{ds_name.upper()} — variable 0 (fit)",
+    )
 
     # print("L2 diff mean:", np.mean((s - r) ** 2))
     # print("MAE mean    :", np.mean(np.abs(s - r)))

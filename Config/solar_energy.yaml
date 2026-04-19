@@ -4,19 +4,19 @@ model:
     seq_length: 96
     feature_size: 137
     timesteps: 96
-    sampling_timesteps: 1
+    sampling_timesteps: 4
     loss_type: 'l1'
     beta_schedule: 'cosine'
     w_grad: False
-    ma_kernel_size: 5
+    ma_kernel_size: 25
     fft_topk: 3
 
 solver:
   base_lr: 1.0e-3
-  max_epochs: 2000
-  results_folder: ./Checkpoints_etth
+  max_epochs: 400
+  results_folder: ./Checkpoints_solar
   gradient_accumulate_every: 2
-  save_cycle: 1800  # max_epochs // 10
+  save_cycle: 50
   ema:
     decay: 0.995
     update_interval: 10
@@ -25,12 +25,12 @@ solver:
     target: engine.lr_sch.ReduceLROnPlateauWithWarmup
     params:
       factor: 0.5
-      patience: 4000
+      patience: 20
       min_lr: 1.0e-5
-      threshold: 1.0e-1
+      threshold: 1.0e-3
       threshold_mode: rel
       warmup_lr: 8.0e-4
-      warmup: 500
+      warmup: 10
       verbose: False
 
 dataloader:
@@ -38,9 +38,9 @@ dataloader:
     target: Utils.Data_utils.real_datasets.CustomDataset
     params:
       name: solar
-      proportion: 0.8  # Set to rate < 1 if training conditional generation
+      proportion: 0.8
       data_root: ./Data/datasets/solar_AL.txt
-      window: 192  # seq_length
+      window: 192
       save2npy: False
       neg_one_to_one: True
       seed: 2024
@@ -50,9 +50,9 @@ dataloader:
     target: Utils.Data_utils.real_datasets.CustomDataset
     params:
       name: solar
-      proportion: 0.2  # rate
+      proportion: 0.2
       data_root: ./Data/datasets/solar_AL.txt
-      window: 192  # seq_length
+      window: 192
       save2npy: False
       neg_one_to_one: True
       seed: 2024
@@ -63,6 +63,6 @@ dataloader:
     step_size: 5.0e-2
     sampling_steps: 200
 
-  batch_size: 128
+  batch_size: 64
   sample_size: 256
   shuffle: True

@@ -60,8 +60,6 @@ class ARMD(nn.Module):
             relation_eps=0.05,  # 耦合矩阵中 A 的混合强度：M=(1-eps)I+eps*A，eps 小则更保守
             gate_scale=0.05,  # gate 上界缩放，与 sigmoid 配合保证初始耦合强度较小
             couple_alpha=0.08,  # 残差融合：x_final = base + alpha*(coupled-base)，保守修正 base
-            couple_loss_weight=0.35,  # lambda_final：联合损失中对 loss_final 的权重
-            reg_weight=1e-3,  # lambda_reg：约束 final 相对 base 的修正幅度
             **kwargs
     ):
         super(ARMD, self).__init__()
@@ -77,16 +75,14 @@ class ARMD(nn.Module):
         self.relation_eps = relation_eps
         self.gate_scale = gate_scale
         self.couple_alpha = couple_alpha
-        self.couple_loss_weight = couple_loss_weight
-        self.reg_weight = reg_weight
-        # 每变量统计量：mean / std / last / temporal-diff mean 共 4 维 -> relation embedding
+        # 每变量统计量：mean / std 共 2 维 -> relation embedding
         self.rel_proj = nn.Sequential(
-            nn.Linear(4, relation_dim),
+            nn.Linear(2, relation_dim),
             nn.GELU(),
             nn.Linear(relation_dim, relation_dim)
         )
-        # step-aware + sample-aware：归一化 t + 每通道时间维 mean/std -> 变量级 gate [B,1,C]
-        gate_in_dim = 1 + 2 * feature_size
+        # 仅基于归一化扩散步 t/T 的 step-aware 变量级 gate [B,1,C]
+        gate_in_dim = 1
         self.gate_mlp = nn.Sequential(
             nn.Linear(gate_in_dim, relation_dim),
             nn.GELU(),
@@ -210,16 +206,11 @@ class ARMD(nn.Module):
         #   - 在 ARMD 中，这里输出的是 x_start（x0 的预测）
 
     def build_relation_matrix(self, x):
-        # x: [B, T, C] — 用多统计量刻画变量表征，再构造 attention-style 行归一化 A，数值更稳
+        # x: [B, T, C] — 仅基于每个变量的时间均值和标准差构造变量关系矩阵
         B, T, C = x.shape
         mean_c = x.mean(dim=1)
         std_c = x.std(dim=1, unbiased=False)
-        last_c = x[:, -1, :]
-        if T >= 2:
-            diff_mean_c = (x[:, 1:, :] - x[:, :-1, :]).mean(dim=1)
-        else:
-            diff_mean_c = torch.zeros_like(mean_c)
-        stats = torch.stack([mean_c, std_c, last_c, diff_mean_c], dim=-1)
+        stats = torch.stack([mean_c, std_c], dim=-1)
         h = self.rel_proj(stats)
         D = h.size(-1)
         logits = torch.matmul(h, h.transpose(-1, -2)) / math.sqrt(D)
@@ -231,17 +222,11 @@ class ARMD(nn.Module):
         return M
 
     def build_step_gate(self, t, x):
-        # t: [B], x: [B, T, C] — 扩散步归一化 + 样本在时间维的 per-channel mean/std，自适应耦合强度
+        # t: [B], x: [B, T, C] — 仅基于归一化扩散步 t/T 构造变量级 gate，不再使用样本统计量
         denom = max(self.num_timesteps - 1, 1)
         t_norm = (t.float() / denom).view(-1, 1)
-        C = x.shape[-1]
-        if C != self.feature_size:
-            raise ValueError(f"build_step_gate: x.shape[-1]={C} != self.feature_size={self.feature_size}")
-        xm = x.mean(dim=1)
-        xs = x.std(dim=1, unbiased=False)
-        gate_in = torch.cat([t_norm, xm, xs], dim=-1)
-        lambda_t = self.gate_scale * self.gate_mlp(gate_in)
-        return lambda_t.view(x.shape[0], 1, C)
+        lambda_t = self.gate_scale * self.gate_mlp(t_norm)
+        return lambda_t.view(x.shape[0], 1, x.shape[-1])
 
     def coupled_trend_from_xstart(self, x_t, t, x_start):
         # x_t: [B, T, C], x_start: [B, T, C]
@@ -396,20 +381,8 @@ class ARMD(nn.Module):
         x_start_base = self.output(x, t, training)
         x_start_coupled, z_hat, z_tilde, M_t, lambda_t = self.coupled_trend_from_xstart(x, t, x_start_base)
         x_start_final = x_start_base + self.couple_alpha * (x_start_coupled - x_start_base)
-        # 联合损失：稳定 base、监督最终用于扩散的预测，并正则化耦合相对 base 的偏离（防 Stock 类过耦合）
-        loss_base = self.loss_fn(x_start_base, target, reduction='none')
-        loss_final = self.loss_fn(x_start_final, target, reduction='none')
-        loss_reg = self.loss_fn(
-            x_start_final - x_start_base,
-            torch.zeros_like(x_start_base),
-            reduction='none',
-        )
-        train_loss = (
-            loss_base
-            + self.couple_loss_weight * loss_final
-            + self.reg_weight * loss_reg
-        )
-        train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
+        loss_pred = self.loss_fn(x_start_final, target, reduction='none')
+        train_loss = reduce(loss_pred, 'b ... -> b (...)', 'mean')
         return train_loss.mean()
 
     def forward(self, x, **kwargs):

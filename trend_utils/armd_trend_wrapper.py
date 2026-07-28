@@ -10,6 +10,44 @@ import torch.nn as nn
 from trend_utils.trend_conv import moving_average_btc
 
 
+def adaptive_moving_average_btc(
+    x: torch.Tensor,
+    min_kernel: int = 5,
+    max_kernel: int = 49,
+    exclude_dc: bool = True,
+):
+    """
+    对每个变量按主频自适应 MA 核大小分解。
+    x: (B, T, C)，返回 trend, seasonal, kernels (C,)。
+    """
+    B, T, C = x.shape
+    device = x.device
+    kernels = []
+    trend_parts = []
+    for j in range(C):
+        s = x[:, :, j]  # (B, T)
+        spec = torch.fft.rfft(s, dim=-1)  # (B, nf)
+        mag_avg = torch.abs(spec).mean(dim=0)  # (nf,)
+        if exclude_dc and mag_avg.numel() > 0:
+            mag_avg = mag_avg.clone()
+            mag_avg[0] = -1
+        peak_idx = int(torch.argmax(mag_avg).item())
+        if peak_idx <= 0:
+            kernel = min_kernel
+        else:
+            period = round(T / peak_idx)
+            kernel = max(min_kernel, min(max_kernel, period))
+        if kernel % 2 == 0:
+            kernel += 1
+        kernels.append(kernel)
+        trend_j, _ = moving_average_btc(x[:, :, j : j + 1], kernel_size=kernel)
+        trend_parts.append(trend_j)
+    trend = torch.cat(trend_parts, dim=-1)
+    seasonal = x - trend
+    kernels = torch.tensor(kernels, device=device, dtype=torch.long)
+    return trend, seasonal, kernels
+
+
 def fft_topk_forecast(
     seasonal: torch.Tensor,
     pred_len: int,
@@ -72,6 +110,9 @@ class ARMDTrendWrapper(nn.Module):
         ma_kernel_size: int = 25,
         fft_topk: int = 5,
         use_nlinear: bool = False,
+        adaptive_ma: bool = True,
+        ma_min_kernel: int = 5,
+        ma_max_kernel: int = 49,
     ):
         super().__init__()
         self.armd = armd
@@ -85,15 +126,30 @@ class ARMDTrendWrapper(nn.Module):
         self.ma_kernel_size = ma_kernel_size
         self.fft_topk = fft_topk
         self.use_nlinear = use_nlinear
+        self.adaptive_ma = adaptive_ma
+        self.ma_min_kernel = ma_min_kernel
+        self.ma_max_kernel = ma_max_kernel
 
     def forward(self, data: torch.Tensor, **kwargs):
         H = self.pred_len
-        trend, _ = moving_average_btc(data, kernel_size=self.ma_kernel_size)
+        if self.adaptive_ma:
+            trend, _, _ = adaptive_moving_average_btc(
+                data, self.ma_min_kernel, self.ma_max_kernel
+            )
+        else:
+            trend, _ = moving_average_btc(data, kernel_size=self.ma_kernel_size)
         kwargs.pop("target", None)
         if self.use_nlinear:
             # NLinear：last=历史最后一步，模型只接收 history 的 trend_centered，无未来泄露
             trend_full = trend
-            trend_hist, _ = moving_average_btc(data[:, :H, :], kernel_size=self.ma_kernel_size)
+            if self.adaptive_ma:
+                trend_hist, _, _ = adaptive_moving_average_btc(
+                    data[:, :H, :], self.ma_min_kernel, self.ma_max_kernel
+                )
+            else:
+                trend_hist, _ = moving_average_btc(
+                    data[:, :H, :], kernel_size=self.ma_kernel_size
+                )
             last = trend_hist[:, -1:, :]
             trend_centered_input = trend_hist - last
             real_target_trend = trend_full[:, H:, :] - last
@@ -108,13 +164,25 @@ class ARMDTrendWrapper(nn.Module):
         H = self.pred_len
         if self.use_nlinear:
             x_hist = x[:, :H, :]
-            trend_hist, seasonal_hist = moving_average_btc(x_hist, kernel_size=self.ma_kernel_size)
+            if self.adaptive_ma:
+                trend_hist, seasonal_hist, _ = adaptive_moving_average_btc(
+                    x_hist, self.ma_min_kernel, self.ma_max_kernel
+                )
+            else:
+                trend_hist, seasonal_hist = moving_average_btc(
+                    x_hist, kernel_size=self.ma_kernel_size
+                )
             last = trend_hist[:, -1:, :]
             trend_centered_hist = trend_hist - last
             trend_pred = self.armd.generate_mts(trend_centered_hist, **kwargs) + last
             seasonal_pred = fft_topk_forecast(seasonal_hist, self.pred_len, topk=self.fft_topk)
         else:
-            trend, seasonal = moving_average_btc(x, kernel_size=self.ma_kernel_size)
+            if self.adaptive_ma:
+                trend, seasonal, _ = adaptive_moving_average_btc(
+                    x, self.ma_min_kernel, self.ma_max_kernel
+                )
+            else:
+                trend, seasonal = moving_average_btc(x, kernel_size=self.ma_kernel_size)
             trend_pred = self.armd.generate_mts(trend, **kwargs)
             seasonal_pred = fft_topk_forecast(seasonal, self.pred_len, topk=self.fft_topk)
         return trend_pred + seasonal_pred

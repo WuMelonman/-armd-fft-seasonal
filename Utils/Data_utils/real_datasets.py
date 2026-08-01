@@ -37,6 +37,8 @@ class CustomDataset(Dataset):
         predict_component = 'raw',  # 'raw' 或 'trend'
         return_aux_in_test = True,  # test阶段是否在dataset里保留 season/raw future 供外部取用
         use_first_n_features=None,  # 若设置，仅使用前 N 列（如 stock 6 列 CSV 只训前 5 个数值特征）
+        scaler_fit_on_train_only=True,  # True：仅在训练段时间上估计 mean/std
+        scaler_fit_ratio=0.8,  # 用于 fit scaler 的时间步比例（应与 train_dataset.proportion 一致）
     ):
 
         super(CustomDataset, self).__init__()
@@ -57,11 +59,11 @@ class CustomDataset(Dataset):
         self.seasonal_period = seasonal_period
         self.predict_component = predict_component
         self.return_aux_in_test = return_aux_in_test
+        self.scaler_fit_on_train_only = scaler_fit_on_train_only
+        self.scaler_fit_ratio = scaler_fit_ratio
 
-        # 读取 CSV 数据并拟合 scaler
-        # rawdata: 原始时间序列 [T, C]
-        # scaler : StandardScaler（在全量数据上 fit；若 use_first_n_features 则仅对截取列 refit）
-        self.rawdata, self.scaler = self.read_data(data_root, self.name)
+        # rawdata: 原始时间序列 [T, C]；scaler 仅在训练段时间上 fit（见 _fit_scaler）
+        self.rawdata = self.read_data(data_root, self.name)
         if use_first_n_features is not None:
             n = int(use_first_n_features)
             if self.rawdata.shape[-1] < n:
@@ -69,7 +71,7 @@ class CustomDataset(Dataset):
                     f"use_first_n_features={n} but data has only {self.rawdata.shape[-1]} columns"
                 )
             self.rawdata = self.rawdata[:, :n]
-            self.scaler = StandardScaler().fit(self.rawdata)
+        self.scaler = self._fit_scaler(self.rawdata)
         # 保存样本和 mask 的目录
         self.dir = os.path.join(output_dir, 'samples')
         os.makedirs(self.dir, exist_ok=True)
@@ -82,7 +84,7 @@ class CustomDataset(Dataset):
         self.auto_norm = False
 
         self.data = self.__normalize(self.rawdata)
-        # 对整条时间序列做标准化
+        # 用训练段估计的 mean/std 标准化整条序列（test 段仅 transform）
         # rawdata [T,C] -> data [T,C]
 
         # ===== ADD: 如果只预测 trend，就把“滑窗数据源”换成 trend_scaled_full =====
@@ -202,8 +204,17 @@ class CustomDataset(Dataset):
         d = self.__unnormalize(sq.reshape(-1, self.var_num))
         return d.reshape(-1, self.window, self.var_num)
     
+    def _fit_scaler(self, data: np.ndarray):
+        """StandardScaler：默认仅在序列前 scaler_fit_ratio 段时间上 fit。"""
+        scaler = StandardScaler()
+        if self.scaler_fit_on_train_only:
+            fit_len = max(1, int(np.ceil(data.shape[0] * self.scaler_fit_ratio)))
+            scaler.fit(data[:fit_len])
+        else:
+            scaler.fit(data)
+        return scaler
+
     def __normalize(self, rawdata):
-        # 对整条序列做 StandardScaler 标准化
         data = self.scaler.transform(rawdata)
         if self.auto_norm:
             data = normalize_to_neg_one_to_one(data)
@@ -243,24 +254,14 @@ class CustomDataset(Dataset):
 
     @staticmethod
     def read_data(filepath, name=''):
-        """
-        从 CSV 读取时间序列数据
-        返回：
-        - data   : 原始序列 [T, C]
-        - scaler : StandardScaler（已 fit）
-        """
+        """从 CSV 读取时间序列，返回原始序列 [T, C]（不在此 fit scaler）。"""
         df = pd.read_csv(filepath, header=0)
 
         # 如果第一列是时间列，删除
         if df.dtypes[0] == 'object':
             df = df.iloc[:, 1:]
 
-        data = df.values
-
-        scaler = StandardScaler()
-        scaler = scaler.fit(data)
-
-        return data, scaler
+        return df.values
     
     def mask_data(self, seed=2023):
         masks = np.ones_like(self.samples)
@@ -301,11 +302,11 @@ class fMRIDataset(CustomDataset):
     ):
         super().__init__(proportion=proportion, **kwargs)
 
+    def _fit_scaler(self, data: np.ndarray):
+        scaler = MinMaxScaler()
+        scaler.fit(data)
+        return scaler
+
     @staticmethod
     def read_data(filepath, name=''):
-        """Reads a single .csv
-        """
-        data = io.loadmat(filepath + '/sim4.mat')['ts']
-        scaler = MinMaxScaler()
-        scaler = scaler.fit(data)
-        return data, scaler
+        return io.loadmat(filepath + '/sim4.mat')['ts']

@@ -12,7 +12,7 @@ model:
 solver:
   base_lr: 1.0e-3
   max_epochs: 2000
-  results_folder: ./Checkpoints_etth
+  results_folder: ./Checkpoints_stock
   gradient_accumulate_every: 2
   save_cycle: 1800  # max_epochs // 10
   ema:
@@ -35,7 +35,7 @@ dataloader:
   train_dataset:
     target: Utils.Data_utils.real_datasets.CustomDataset
     params:
-      name: etth
+      name: stock
       proportion: 0.8  # Set to rate < 1 if training conditional generation
       data_root: ./Data/datasets/stock_data.csv
       use_first_n_features: 5  # CSV 多列时只用前 5 列，与 model.feature_size 一致
@@ -44,12 +44,16 @@ dataloader:
       neg_one_to_one: True
       seed: 2024
       period: train
+      # 与论文一致：μ/σ 在整段序列上估计（股价有强漂移，train-only 会让 test 偏离到 mean≈3.8）
+      scaler_fit_on_train_only: False
 
   test_dataset:
     target: Utils.Data_utils.real_datasets.CustomDataset
     params:
-      name: etth
-      proportion: 0.2  # rate
+      name: stock
+      # divide(ratio) 把前 ratio 当 train、后面当 test；period=test 取后半段
+      # 要用后 20% 做测试，这里必须是 0.8（不是 0.2）
+      proportion: 0.8
       data_root: ./Data/datasets/stock_data.csv
       use_first_n_features: 5
       window: 192  # seq_length
@@ -59,6 +63,7 @@ dataloader:
       period: test
       style: separate
       distribution: geometric
+      scaler_fit_on_train_only: False
     coefficient: 1.0e-2
     step_size: 5.0e-2
     sampling_steps: 200

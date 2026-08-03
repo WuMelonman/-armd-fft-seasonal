@@ -7,11 +7,12 @@ from einops import reduce
 from tqdm.auto import tqdm
 from Models.autoregressive_diffusion.linear import Linear
 from Models.autoregressive_diffusion.model_utils import default, extract
+from Models.autoregressive_diffusion.dilated_tcn import LongRangeTCNBranch
 
 
 # gaussian diffusion trainer class
 
-pred_len = 96  # 预测长度（未来要预测的时间步数）
+# 预测长度由 self.pred_len / Config.seq_length 决定
 
 def linear_beta_schedule(timesteps):
     # 线性 beta 调度：beta 从 beta_start 线性增长到 beta_end
@@ -60,6 +61,15 @@ class ARMD(nn.Module):
             relation_eps=0.05,  # 耦合矩阵中 A 的混合强度：M=(1-eps)I+eps*A，eps 小则更保守
             gate_scale=0.05,  # gate 上界缩放，与 sigmoid 配合保证初始耦合强度较小
             couple_alpha=0.08,  # 残差融合：x_final = base + alpha*(coupled-base)，保守修正 base
+            # ---- optional long-range TCN residual branch (default off: old YAML compatible) ----
+            use_long_range_tcn: bool = False,
+            tcn_hidden_dim: int = 64,
+            tcn_dilations=(1, 2, 4, 8, 16, 32),
+            tcn_dropout: float = 0.1,
+            # 推荐 1e-3：初始几乎退化为原 ARMD，同时保证 gamma 与 TCN 内部能立刻收到梯度
+            # （若设 0.0 且 output_proj 零初始化，则 gamma/内部参数首轮梯度均为 0）
+            tcn_gamma_init: float = 1e-3,
+            tcn_out_init_std: float = 1e-3,
             **kwargs
     ):
         super(ARMD, self).__init__()
@@ -75,6 +85,26 @@ class ARMD(nn.Module):
         self.relation_eps = relation_eps
         self.gate_scale = gate_scale
         self.couple_alpha = couple_alpha
+
+        # Dilated TCN residual on clean trend estimate (before relation coupling)
+        self.use_long_range_tcn = bool(use_long_range_tcn)
+        self._tcn_debug_printed = False
+        self._tcn_last_stats = None
+        if self.use_long_range_tcn:
+            if isinstance(tcn_dilations, list):
+                tcn_dilations = tuple(tcn_dilations)
+            self.long_range_tcn = LongRangeTCNBranch(
+                feature_size=feature_size,
+                timesteps=timesteps,
+                hidden_dim=int(tcn_hidden_dim),
+                dilations=tcn_dilations,
+                dropout=float(tcn_dropout),
+                out_init_std=float(tcn_out_init_std),
+            )
+            self.tcn_gamma = nn.Parameter(torch.tensor(float(tcn_gamma_init)))
+        else:
+            self.long_range_tcn = None
+            self.tcn_gamma = None
         # 每变量统计量：mean / std 共 2 维 -> relation embedding
         self.rel_proj = nn.Sequential(
             nn.Linear(2, relation_dim),
@@ -199,11 +229,34 @@ class ARMD(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
     def output(self, x, t, training=False):
-        model_output = self.model(x, t, training=training)
-        return model_output
-        # 将当前带噪样本 x 和时间步 t 输入到去噪网络中
-        # model 的输出含义取决于作者设计：
-        #   - 在 ARMD 中，这里输出的是 x_start（x0 的预测）
+        # backbone → clean trend estimate x0_base ([B, T, C])
+        # 可选：Dilated TCN 残差增强后再进入 relation coupling / noise recovery
+        x0_base = self.model(x, t, training=training)
+        x0_pred = x0_base
+        if self.use_long_range_tcn:
+            tcn_residual = self.long_range_tcn(x, t)
+            if tcn_residual.shape != x0_base.shape:
+                raise RuntimeError(
+                    f"TCN residual shape {tuple(tcn_residual.shape)} "
+                    f"does not match base prediction shape {tuple(x0_base.shape)}"
+                )
+            x0_pred = x0_base + self.tcn_gamma * tcn_residual
+            self._tcn_last_stats = {
+                'gamma': float(self.tcn_gamma.detach().item()),
+                'tcn_residual_abs_mean': float(tcn_residual.detach().abs().mean().item()),
+                'x0_base_abs_mean': float(x0_base.detach().abs().mean().item()),
+            }
+            if not self._tcn_debug_printed:
+                print(
+                    "[LongRangeTCN]\n"
+                    f"input shape: {tuple(x.shape)}\n"
+                    f"base output shape: {tuple(x0_base.shape)}\n"
+                    f"TCN residual shape: {tuple(tcn_residual.shape)}\n"
+                    f"gamma: {self._tcn_last_stats['gamma']}",
+                    flush=True,
+                )
+                self._tcn_debug_printed = True
+        return x0_pred
 
     def build_relation_matrix(self, x):
         # x: [B, T, C] — 仅基于每个变量的时间均值和标准差构造变量关系矩阵
@@ -297,7 +350,7 @@ class ARMD(nn.Module):
         shape = x.shape
         # 取输入序列的前 pred_len 作为初始“噪声序列”
         # 注意：这里不是纯随机噪声，而是条件生成（基于历史）
-        img = x[:, :pred_len, :]
+        img = x[:, :self.pred_len, :]
 
         for t in tqdm(reversed(range(0, self.num_timesteps)),
                       desc='sampling loop time step', total=self.num_timesteps):
@@ -320,7 +373,7 @@ class ARMD(nn.Module):
 
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-        img = x[:, :pred_len, :]
+        img = x[:, :self.pred_len, :]
 
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
@@ -358,10 +411,11 @@ class ARMD(nn.Module):
     def q_sample(self, x_start, t, noise=None):
         # 当输入长度 <= pred_len 时直接返回整段，避免空切片
         seq_len = x_start.shape[1]
-        if seq_len <= pred_len:
+        H = self.pred_len
+        if seq_len <= H:
             return x_start
         index = int(t[0]) + 1
-        x_middle = x_start[:, pred_len - index : -index, :]
+        x_middle = x_start[:, H - index : -index, :]
         return x_middle
 
     def _train_loss(self, x_start, t, target=None, noise=None, training=True):
@@ -374,7 +428,7 @@ class ARMD(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
         # 仅当未传入 target 时，使用 x_start 的未来段作为 target；若外部已传 target 则不覆盖
         if target is None:
-            target = x_start[:, pred_len:, :]
+            target = x_start[:, self.pred_len:, :]
         x = self.q_sample(x_start=x_start, t=t, noise=noise)  # noise sample
         # 将中间态 x 和时间步 t 输入模型
         # model_out 是模型预测的 x_start（即 x0 的预测）

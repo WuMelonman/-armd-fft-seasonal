@@ -1,6 +1,5 @@
 """
-trend_conv 固定 MA 分解的可视化：Original / Trend (MA) / Seasonal / Reconstructed.
-与参考图布局一致，纵排、共享 x 轴。
+Adaptive MA decomposition visualization + forecast fit plots.
 """
 
 import os
@@ -21,10 +20,16 @@ def plot_trend_decomposition(
     kernel_size: int = 25,
     channel_idx: int = 0,
     save_path: str = "trend_decomposition.png",
+    model=None,
+    adaptive_ma: bool = True,
+    ma_min_kernel: int = 5,
+    ma_max_kernel: int = 49,
 ):
     """
-    从 loader 取第一个 batch 的第一个样本，用固定 MA 分解画图。
-    不依赖可训练的 trend_conv，直接使用 moving_average_btc。
+    从 loader 取第一个 batch 的第一个样本做分解画图。
+
+    若传入 ``model``（ARMDTrendWrapper），则调用与训练相同的 ``model.decompose``。
+    否则：adaptive_ma=True 时用自适应 MA；否则用固定 kernel_size。
     """
     print("[Plot] preparing first batch for MA decomposition...", flush=True)
     batch = next(iter(loader))
@@ -32,27 +37,55 @@ def plot_trend_decomposition(
     x = x[:1]  # (1, T, C)
 
     with torch.no_grad():
-        trend, seasonal = moving_average_btc(x, kernel_size=kernel_size)
+        if model is not None and hasattr(model, "decompose"):
+            # move to model device if needed
+            dev = next(model.parameters(), torch.tensor(0.0)).device
+            if hasattr(model, "armd"):
+                try:
+                    dev = model.armd.betas.device
+                except Exception:
+                    pass
+            x_dev = x.to(dev)
+            trend, seasonal, kernels = model.decompose(x_dev, return_kernel_sizes=True)
+            trend = trend.cpu()
+            seasonal = seasonal.cpu()
+            kernels_list = kernels.detach().cpu().tolist()
+            print("[Adaptive MA] kernel sizes:", kernels_list, flush=True)
+            k_ch = int(kernels_list[channel_idx]) if channel_idx < len(kernels_list) else -1
+            trend_title = f"Adaptive Trend (MA), kernel={k_ch}"
+            fig_suptitle = f"Adaptive MA decomposition — variable {channel_idx}, kernel size = {k_ch}"
+        elif adaptive_ma:
+            from trend_utils.armd_trend_wrapper import adaptive_moving_average_btc
 
-    original = x.squeeze(0).cpu().numpy()       # (T, C)
-    trend_np = trend.squeeze(0).cpu().numpy()   # (T, C)
-    seasonal_np = seasonal.squeeze(0).cpu().numpy()  # (T, C)
-    reconstructed = trend_np + seasonal_np      # 应等于 original
+            trend, seasonal, kernels = adaptive_moving_average_btc(
+                x, min_kernel=ma_min_kernel, max_kernel=ma_max_kernel
+            )
+            kernels_list = kernels.detach().cpu().tolist()
+            print("[Adaptive MA] kernel sizes:", kernels_list, flush=True)
+            k_ch = int(kernels_list[channel_idx])
+            trend_title = f"Adaptive Trend (MA), kernel={k_ch}"
+            fig_suptitle = f"Adaptive MA decomposition — variable {channel_idx}, kernel size = {k_ch}"
+        else:
+            trend, seasonal = moving_average_btc(x, kernel_size=kernel_size)
+            trend_title = f"Trend (MA, k={kernel_size})"
+            fig_suptitle = f"Fixed MA decomposition — variable {channel_idx}, kernel size = {kernel_size}"
+
+    original = x.squeeze(0).cpu().numpy()
+    trend_np = trend.squeeze(0).cpu().numpy()
+    seasonal_np = seasonal.squeeze(0).cpu().numpy()
+    reconstructed = trend_np + seasonal_np
 
     t = range(original.shape[0])
-    fig, axes = plt.subplots(4, 1, figsize=(10, 7), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(10, 8), sharex=True)
+    fig.suptitle(fig_suptitle, fontsize=11)
     axes[0].plot(t, original[:, channel_idx])
     axes[0].set_title("Original")
-    axes[0].set_ylabel("")
     axes[1].plot(t, trend_np[:, channel_idx])
-    axes[1].set_title("Trend (MA)")
-    axes[1].set_ylabel("")
+    axes[1].set_title(trend_title)
     axes[2].plot(t, seasonal_np[:, channel_idx])
-    axes[2].set_title("Seasonal (= Original − Trend)")
-    axes[2].set_ylabel("")
+    axes[2].set_title("High-frequency residual (= Original − Trend)")
     axes[3].plot(t, reconstructed[:, channel_idx])
-    axes[3].set_title("Reconstructed (Trend + Seasonal)")
-    axes[3].set_ylabel("")
+    axes[3].set_title("Reconstructed (Trend + Residual)")
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
@@ -129,7 +162,6 @@ def plot_forecast_fit(
             stem = os.path.splitext(os.path.basename(str(dr)))[0]
             title = f"{stem} — variable {channel_idx} (fit)"
 
-    # 参考色：与柱状图脚本可对照（蓝 / 橙）
     c_gt = "#4C78A8"
     c_pr = "#F58518"
 
@@ -137,32 +169,17 @@ def plot_forecast_fit(
         figsize = (8.0, 5.0)
     lw_curve = 2.4
     fig, ax = plt.subplots(figsize=figsize, dpi=300)
-    ax.plot(t, y_gt, color=c_gt, linewidth=lw_curve, label=gt_label, zorder=2, solid_capstyle="round")
-    ax.plot(t, y_pr, color=c_pr, linewidth=lw_curve, label=pred_label, zorder=2, solid_capstyle="round")
-    ax.grid(True, linestyle="--", alpha=0.35, color="0.75", zorder=0)
-    ax.set_axisbelow(True)
-    ax.tick_params(axis="both", labelsize=11)
-    ax.margins(x=0.008)
-    for spine in ax.spines.values():
-        spine.set_linewidth(1.1)
-        spine.set_color("0.15")
-
+    ax.plot(t, y_gt, color=c_gt, lw=lw_curve, label=gt_label, zorder=2)
+    ax.plot(t, y_pr, color=c_pr, lw=lw_curve, label=pred_label, zorder=3)
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Value")
     if title:
-        ax.set_title(title, fontsize=12, pad=8)
-    leg = ax.legend(
-        loc="upper left",
-        bbox_to_anchor=(0.02, 0.98),
-        frameon=True,
-        fancybox=False,
-        edgecolor="0.7",
-        fontsize=11,
-    )
-    leg.get_frame().set_linewidth(0.6)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        ax.set_title(title)
+    ax.legend(frameon=False, loc="best")
+    ax.grid(True, linestyle="--", alpha=0.35, color="#B0B0B0")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"[Plot] forecast fit saved to {save_path}", flush=True)
-
-
-__all__ = ["plot_trend_decomposition", "plot_forecast_fit"]

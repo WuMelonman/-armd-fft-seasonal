@@ -103,7 +103,7 @@ if __name__ == "__main__":
     # 包装到 Args_Example 类（方便后续使用）
     args = Args_Example(args_parsed.config_path, args_parsed.save_dir, args_parsed.gpu)
     #print(args),地址
-    seq_len = 96# One-shot 预测长度
+    seq_len = 96  # One-shot 预测长度
     configs = load_yaml_config(args.config_path) # 读取 YAML 配置（包含模型结构、超参数、数据设置等）
     #print(configs)
 

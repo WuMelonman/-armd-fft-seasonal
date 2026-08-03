@@ -71,15 +71,57 @@ class Trainer(object):
         torch.save(data, str(self.results_folder / f'checkpoint-{milestone}.pt'))
 
     def load(self, milestone, verbose=False):
-        """加载某个 checkpoint"""
+        """加载某个 checkpoint。
+
+        若启用了 long-range TCN，而旧 checkpoint 不含 long_range_tcn.* / tcn_gamma，
+        则用 strict=False 加载，但只允许这些新增键缺失；其他 missing/unexpected 仍报错。
+        """
         if self.logger is not None and verbose:
             self.logger.log_info('Resume from {}'.format(str(self.results_folder / f'checkpoint-{milestone}.pt')))
         device = self.device
         data = torch.load(str(self.results_folder / f'checkpoint-{milestone}.pt'), map_location=device)
-        self.model.load_state_dict(data['model'])
+        state = data['model']
+        armd = getattr(self.model, 'armd', self.model)
+        use_trend_tcn = bool(getattr(armd, 'use_long_range_tcn', False))
+        use_residual_tcn = (
+            getattr(self.model, 'residual_predictor', 'fft') == 'tcn'
+            or getattr(self.model, 'residual_tcn', None) is not None
+        )
+        if use_trend_tcn or use_residual_tcn:
+            missing, unexpected = self.model.load_state_dict(state, strict=False)
+            allowed_missing_prefixes = (
+                'long_range_tcn.',
+                'tcn_gamma',
+                'armd.long_range_tcn.',
+                'armd.tcn_gamma',
+                'residual_tcn.',
+            )
+            bad_missing = [
+                k for k in missing
+                if not any(k == p or k.startswith(p) for p in allowed_missing_prefixes)
+            ]
+            if bad_missing or unexpected:
+                raise RuntimeError(
+                    f"Checkpoint load failed. missing={list(missing)}, unexpected={list(unexpected)}. "
+                    f"Only new TCN keys may be missing when TCN modules are enabled."
+                )
+            print(
+                f"[checkpoint] loaded with strict=False; missing={list(missing)}; unexpected={list(unexpected)}",
+                flush=True,
+            )
+        else:
+            self.model.load_state_dict(state)
         self.step = data['step']
-        self.opt.load_state_dict(data['opt'])
-        self.ema.load_state_dict(data['ema'])
+        # 旧 ckpt 的 optimizer 可能缺少 TCN 参数状态；允许失败后重建
+        try:
+            self.opt.load_state_dict(data['opt'])
+        except (ValueError, KeyError, RuntimeError) as e:
+            print(f"[checkpoint] skip optimizer state load ({e}); keep fresh optimizer.", flush=True)
+        try:
+            self.ema.load_state_dict(data['ema'])
+        except (ValueError, KeyError, RuntimeError) as e:
+            print(f"[checkpoint] EMA strict load failed ({e}); retry strict=False.", flush=True)
+            self.ema.load_state_dict(data['ema'], strict=False)
         self.milestone = milestone
 
     def train(self):
@@ -122,15 +164,51 @@ class Trainer(object):
                         self.save(self.milestone)
                         # self.logger.log_info('saved in {}'.format(str(self.results_folder / f'checkpoint-{self.milestone}.pt')))
                     
-                    if self.logger is not None and self.step % self.log_frequency == 0:
-                        # info = '{}: train'.format(self.args.name)
-                        # info = info + ': Epoch {}/{}'.format(self.step, self.train_num_steps)
-                        # info += ' ||'
-                        # info += '' if loss_f == 'none' else ' Fourier Loss: {:.4f}'.format(loss_f.item())
-                        # info += '' if loss_r == 'none' else ' Reglarization: {:.4f}'.format(loss_r.item())
-                        # info += ' | Total Loss: {:.6f}'.format(total_loss)
-                        # self.logger.log_info(info)
-                        self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step) # 记录 loss
+                    if self.step % self.log_frequency == 0:
+                        armd = getattr(self.model, 'armd', self.model)
+                        trend_stats = getattr(armd, '_tcn_last_stats', None)
+                        res_stats = getattr(self.model, '_last_loss_stats', None)
+                        if self.logger is not None:
+                            self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
+                            if trend_stats is not None:
+                                self.logger.add_scalar('train/tcn_gamma', trend_stats['gamma'], self.step)
+                                self.logger.add_scalar(
+                                    'train/tcn_residual_abs_mean',
+                                    trend_stats['tcn_residual_abs_mean'],
+                                    self.step,
+                                )
+                                self.logger.add_scalar(
+                                    'train/x0_base_abs_mean',
+                                    trend_stats['x0_base_abs_mean'],
+                                    self.step,
+                                )
+                            if res_stats is not None:
+                                for k in (
+                                    'loss_total',
+                                    'loss_trend',
+                                    'loss_residual',
+                                    'loss_final',
+                                    'residual_pred_abs_mean',
+                                    'target_residual_abs_mean',
+                                ):
+                                    if k in res_stats:
+                                        self.logger.add_scalar(f'train/{k}', res_stats[k], self.step)
+                        else:
+                            if trend_stats is not None:
+                                print(
+                                    f"[TrendTCN] step={self.step} gamma={trend_stats['gamma']:.6g} "
+                                    f"res_abs={trend_stats['tcn_residual_abs_mean']:.6g}",
+                                    flush=True,
+                                )
+                            if res_stats is not None:
+                                print(
+                                    f"[ResidualTCN] step={self.step} "
+                                    f"total={res_stats['loss_total']:.6g} "
+                                    f"trend={res_stats['loss_trend']:.6g} "
+                                    f"resid={res_stats['loss_residual']:.6g} "
+                                    f"final={res_stats['loss_final']:.6g}",
+                                    flush=True,
+                                )
 
                 pbar.update(1)
 

@@ -114,8 +114,8 @@ if __name__ == "__main__":
     # 包装到 Args_Example 类（方便后续使用）
     args = Args_Example(args_parsed.config_path, args_parsed.save_dir, args_parsed.gpu)
     #print(args),地址
-    seq_len = 96# One-shot 预测长度
     configs = load_yaml_config(args.config_path) # 读取 YAML 配置（包含模型结构、超参数、数据设置等）
+    seq_len = int(configs['model']['params']['seq_length'])  # One-shot 预测长度（window=2*seq_len）
     #print(configs)
 
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')# 选择 GPU 或 CPU
@@ -125,9 +125,12 @@ if __name__ == "__main__":
     armd = instantiate_from_config(configs['model']).to(device)
 
     feature_size = configs['model']['params']['feature_size']
-    ma_kernel_size = configs['model']['params'].get('ma_kernel_size', 25)
-    fft_topk = configs['model']['params'].get('fft_topk', 5)
-    use_nlinear = configs['model']['params'].get('use_nlinear', False)
+    mp = configs['model']['params']
+    ma_kernel_size = mp.get('ma_kernel_size', 25)
+    fft_topk = mp.get('fft_topk', 5)
+    use_nlinear = mp.get('use_nlinear', False)
+    adaptive_ma = mp.get('adaptive_ma', True)
+    residual_predictor = mp.get('residual_predictor', 'fft')
 
     model = ARMDTrendWrapper(
         armd=armd,
@@ -135,6 +138,18 @@ if __name__ == "__main__":
         ma_kernel_size=ma_kernel_size,
         fft_topk=fft_topk,
         use_nlinear=use_nlinear,
+        adaptive_ma=adaptive_ma,
+        ma_min_kernel=mp.get('ma_min_kernel', 5),
+        ma_max_kernel=mp.get('ma_max_kernel', 49),
+        residual_predictor=residual_predictor,
+        residual_tcn_hidden_dim=mp.get('residual_tcn_hidden_dim', 32),
+        residual_tcn_dilations=mp.get('residual_tcn_dilations', [1, 2, 4, 8]),
+        residual_tcn_kernel_size=mp.get('residual_tcn_kernel_size', 3),
+        residual_tcn_dropout=mp.get('residual_tcn_dropout', 0.1),
+        final_loss_weight=mp.get('final_loss_weight', 1.0),
+        final_mae_weight=mp.get('final_mae_weight', 0.5),
+        trend_loss_weight=mp.get('trend_loss_weight', 0.2),
+        residual_loss_weight=mp.get('residual_loss_weight', 0.1),
     ).to(device)
     #configs['solver']['max_epochs']=100
     ###################################################
@@ -143,10 +158,18 @@ if __name__ == "__main__":
     dataloader_info = build_dataloader(configs, args) #print(dataloader_info) 地址
     dataloader = dataloader_info['dataloader']
     ###################################################
-    # 训练前：画一张 MA 分解图（Original / Trend(MA) / Seasonal / Reconstructed）
+    # 训练前：与训练同一套自适应分解画图
     ###################################################
     plot_path = os.path.join(args.save_dir, 'trend_decomposition.png')
-    plot_trend_decomposition(dataloader, kernel_size=ma_kernel_size, save_path=plot_path)
+    plot_trend_decomposition(
+        dataloader,
+        kernel_size=ma_kernel_size,
+        save_path=plot_path,
+        model=model,
+        adaptive_ma=adaptive_ma,
+        ma_min_kernel=mp.get('ma_min_kernel', 5),
+        ma_max_kernel=mp.get('ma_max_kernel', 49),
+    )
     ###################################################
 
     trainer = Trainer(config=configs, args=args, model=model, dataloader={'dataloader':dataloader})# 初始化 Trainer（包含优化器、损失函数、训练流程等）

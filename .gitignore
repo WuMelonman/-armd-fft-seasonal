@@ -3,3 +3,7 @@ Checkpoints_*/
 forecasting_exp/
 __pycache__/
 *.pyc
+# local smoke / cache artifacts
+forecasting_exp_res_tcn_smoke/
+forecasting_exp_tcn_smoke/
+**/samples/*.npy

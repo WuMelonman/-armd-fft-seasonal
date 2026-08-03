@@ -25,8 +25,6 @@ def cosine_beta_schedule(timesteps, s=0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
-timesteps = 96
-
 class Linear(nn.Module):
     def __init__(
         self,
@@ -37,8 +35,8 @@ class Linear(nn.Module):
     ):
         super().__init__()
         self.linear = nn.Linear(n_channel, n_channel)
-        self.betas = linear_beta_schedule(96)
-        self.betas_dev = cosine_beta_schedule(96)
+        self.betas = linear_beta_schedule(n_channel)
+        self.betas_dev = cosine_beta_schedule(n_channel)
         self.alphas = 1. - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
         self.alphas_dev = 1. - self.betas_dev

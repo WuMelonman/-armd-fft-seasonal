@@ -11,6 +11,28 @@ model:
     ma_kernel_size: 48
     fft_topk: 5
 
+    # Adaptive MA (default True). ma_kernel_size is fallback when adaptive_ma=False
+    adaptive_ma: True
+
+    # High-frequency residual predictor: 'fft' (legacy) or 'tcn'
+    residual_predictor: 'tcn'
+    residual_tcn_hidden_dim: 32
+    residual_tcn_dilations: [1, 2, 4, 8]
+    residual_tcn_kernel_size: 3
+    residual_tcn_dropout: 0.1
+    final_loss_weight: 1.0
+    final_mae_weight: 0.5
+    trend_loss_weight: 0.2
+    residual_loss_weight: 0.1
+
+    # Dilated TCN residual branch on clean trend estimate (optional; omit to keep original ARMD)
+    use_long_range_tcn: True
+    tcn_hidden_dim: 64
+    tcn_dilations: [1, 2, 4, 8, 16, 32]
+    tcn_dropout: 0.1
+    tcn_gamma_init: 0.001
+    tcn_out_init_std: 0.001
+
 solver:
   base_lr: 1.0e-3
   max_epochs: 2000
